@@ -276,7 +276,8 @@ User idea:
 ${idea}
 `.trim();
 
-    const schema = zodToJsonSchema(OutputSchema);
+    const schema = zodToJsonSchema(OutputSchema as unknown as z.ZodTypeAny);
+
 
     async function generateOnce(model: string) {
       return ai.models.generateContent({
