@@ -1,33 +1,48 @@
+// src/app/api/analyze/route.ts
 import { NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
-import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
 import { createHash } from "crypto";
 
 export const runtime = "nodejs";
 
+type EnhanceResult = {
+  clean: string;
+  detailed: string;
+  extreme: string;
+  negative: string;
+  params: {
+    aspectRatio?: string;
+    notes?: string;
+  };
+};
+
 /** =========================
- *  SCHEMAS
+ *  JSON SCHEMA (NO ZOD)
  *  ========================= */
-const OutputSchema = z.object({
-  clean: z.string(),
-  detailed: z.string(),
-  extreme: z.string(),
-  negative: z.string(),
-  params: z.object({
-    aspectRatio: z.string().optional(),
-    notes: z.string().optional(),
-  }),
-});
+const OutputJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    clean: { type: "string" },
+    detailed: { type: "string" },
+    extreme: { type: "string" },
+    negative: { type: "string" },
+    params: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        aspectRatio: { type: "string" },
+        notes: { type: "string" },
+      },
+      required: [],
+    },
+  },
+  required: ["clean", "detailed", "extreme", "negative", "params"],
+} as const;
 
-const LooseSchema = z.object({
-  clean: z.any().optional(),
-  detailed: z.any().optional(),
-  extreme: z.any().optional(),
-  negative: z.any().optional(),
-  params: z.any().optional(),
-});
-
+/** =========================
+ *  STYLE MAPS
+ *  ========================= */
 const STYLE_MAP: Record<string, string> = {
   none: "",
   "game-2d-toon":
@@ -56,8 +71,7 @@ const STYLE_NEGATIVE: Record<string, string> = {
     "photorealistic, realistic, real photo, complex texture, noisy lighting, HDR photo, skin pores",
   "anime-cel":
     "photorealistic, real photo, detailed skin pores, camera noise, HDR photo",
-  chibi:
-    "photorealistic, realistic anatomy, adult proportions, real photo, creepy realism",
+  chibi: "photorealistic, realistic anatomy, adult proportions, real photo, creepy realism",
   "vector-logo":
     "photorealistic, 3d render, bevel, heavy texture, complex background, gradients everywhere",
   "pixel-art":
@@ -109,20 +123,17 @@ function cacheGet(key: string) {
 }
 
 function cacheSet(key: string, value: any) {
-  // simple purge if too big
   if (CACHE.size >= CACHE_MAX) {
     const now = Date.now();
     for (const [k, v] of CACHE.entries()) {
       if (now > v.expiresAt) CACHE.delete(k);
       if (CACHE.size < CACHE_MAX) break;
     }
-    // still too big -> delete oldest-ish (first key)
     if (CACHE.size >= CACHE_MAX) {
       const firstKey = CACHE.keys().next().value;
       if (firstKey) CACHE.delete(firstKey);
     }
   }
-
   CACHE.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
@@ -131,6 +142,15 @@ function cacheSet(key: string, value: any) {
  *  ========================= */
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function parsePossiblyJsonMessage(e: any): any {
+  const msg = String(e?.message ?? e ?? "");
+  try {
+    return JSON.parse(msg);
+  } catch {
+    return null;
+  }
 }
 
 function isOverloadedError(e: any): boolean {
@@ -142,21 +162,9 @@ function isOverloadedError(e: any): boolean {
   )
     return true;
 
-  try {
-    const j = JSON.parse(msg);
-    if (j?.error?.code === 503 || j?.error?.status === "UNAVAILABLE") return true;
-  } catch {}
-
+  const j = parsePossiblyJsonMessage(e);
+  if (j?.error?.code === 503 || j?.error?.status === "UNAVAILABLE") return true;
   return false;
-}
-
-function parsePossiblyJsonMessage(e: any): any {
-  const msg = String(e?.message ?? e ?? "");
-  try {
-    return JSON.parse(msg);
-  } catch {
-    return null;
-  }
 }
 
 function isQuotaExceededError(e: any): boolean {
@@ -185,7 +193,7 @@ function extractRetryAfterSeconds(e: any): number | null {
     const retryInfo = details.find((d: any) =>
       String(d?.["@type"] ?? "").includes("RetryInfo")
     );
-    const delay = retryInfo?.retryDelay; // "40s"
+    const delay = retryInfo?.retryDelay;
     if (typeof delay === "string") {
       const mm = delay.match(/([0-9.]+)s/i);
       if (mm?.[1]) return Math.max(1, Math.ceil(Number(mm[1])));
@@ -196,13 +204,10 @@ function extractRetryAfterSeconds(e: any): number | null {
 
 function extractAspectRatio(text: string): string | undefined {
   if (!text) return;
-
   const mj = text.match(/--ar\s*([0-9]+\s*:\s*[0-9]+)/i);
   if (mj?.[1]) return mj[1].replace(/\s+/g, "");
-
   const plain = text.match(/\b([0-9]{1,2}\s*:\s*[0-9]{1,2})\b/);
   if (plain?.[1]) return plain[1].replace(/\s+/g, "");
-
   return;
 }
 
@@ -231,49 +236,56 @@ function mergeNegative(base: string, extra: string): string {
   return (b + ", " + toAdd.join(", ")).replace(/\s+/g, " ").trim();
 }
 
-function extractResponseText(resp: any): string {
-  return (
-    resp?.text ??
-    resp?.response?.text ??
-    resp?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text).join("") ??
-    ""
-  );
+function asString(v: any): string {
+  return typeof v === "string" ? v : "";
 }
 
-/**
- * Normalize output: tự sửa khi model thiếu field hoặc type sai
- */
-function normalizeOutput(raw: any, artStyle: string) {
-  const r = LooseSchema.parse(raw);
+async function getResponseText(response: any): Promise<string> {
+  if (!response) return "";
+  if (typeof response.text === "function") {
+    const t = response.text();
+    return typeof t === "string" ? t : String(t ?? "");
+  }
+  if (typeof response.text === "string") return response.text;
 
-  let clean = typeof r.clean === "string" ? r.clean : "";
-  let detailed = typeof r.detailed === "string" ? r.detailed : clean;
-  let extreme = typeof r.extreme === "string" ? r.extreme : detailed;
+  const maybe =
+    response?.response?.candidates?.[0]?.content?.parts
+      ?.map((p: any) => p?.text ?? "")
+      .join("") ?? "";
+  return String(maybe);
+}
 
-  let negative = typeof r.negative === "string" ? r.negative : "";
+/** Normalize output: auto-fix missing fields / wrong types */
+function normalizeOutput(raw: any, artStyle: string): EnhanceResult {
+  const r = raw && typeof raw === "object" ? raw : {};
 
-  // params đôi lúc bị trả về string/array => xử lý mềm
+  let clean = asString(r.clean);
+  let detailed = asString(r.detailed) || clean;
+  let extreme = asString(r.extreme) || detailed;
+
+  let negative = asString(r.negative);
+
+  // params (string/array/object tolerated)
   let params: { aspectRatio?: string; notes?: string } = {};
   if (typeof r.params === "string") {
-    params = { notes: r.params };
+    params.notes = r.params;
   } else if (r.params && typeof r.params === "object" && !Array.isArray(r.params)) {
     const ar =
-      typeof (r.params as any).aspectRatio === "string"
-        ? (r.params as any).aspectRatio
-        : typeof (r.params as any).aspect_ratio === "string"
-        ? (r.params as any).aspect_ratio
+      typeof r.params.aspectRatio === "string"
+        ? r.params.aspectRatio
+        : typeof r.params.aspect_ratio === "string"
+        ? r.params.aspect_ratio
         : undefined;
 
     const notes =
-      typeof (r.params as any).notes === "string"
-        ? (r.params as any).notes
-        : typeof (r.params as any).note === "string"
-        ? (r.params as any).note
+      typeof r.params.notes === "string"
+        ? r.params.notes
+        : typeof r.params.note === "string"
+        ? r.params.note
         : undefined;
 
-    params = { aspectRatio: ar, notes };
-  } else {
-    params = {};
+    if (ar) params.aspectRatio = ar;
+    if (notes) params.notes = notes;
   }
 
   const arFromText =
@@ -281,22 +293,28 @@ function normalizeOutput(raw: any, artStyle: string) {
     extractAspectRatio(extreme) ||
     extractAspectRatio(detailed) ||
     extractAspectRatio(clean);
-
   if (arFromText) params.aspectRatio = arFromText;
 
   clean = stripAspectRatioFlags(clean);
   detailed = stripAspectRatioFlags(detailed);
   extreme = stripAspectRatioFlags(extreme);
 
+  // style negative + baseline negative
   const extraNeg = STYLE_NEGATIVE[artStyle] ?? STYLE_NEGATIVE.none;
   negative = mergeNegative(negative, extraNeg);
 
+  // NOTE: keeping "logo" here is fine for analyze; if it harms your logo case, remove it.
   negative = mergeNegative(
     negative,
-    "text, words, letters, watermark, signature, logo, UI, frame, border, blurry, low quality"
+    "text, words, letters, watermark, signature, UI, frame, border, blurry, low quality"
   );
 
-  return OutputSchema.parse({ clean, detailed, extreme, negative, params });
+  // ensure required
+  if (!clean) clean = "A {SUBJECT} in the same style as the reference image, game-asset friendly.";
+  if (!detailed) detailed = clean;
+  if (!extreme) extreme = detailed;
+
+  return { clean, detailed, extreme, negative, params };
 }
 
 /** =========================
@@ -331,20 +349,10 @@ export async function POST(req: Request) {
 
     // cache key
     const imgHash = createHash("sha256").update(buf).digest("hex");
-    const cacheKey = [
-      "analyze:v1",
-      mode,
-      target,
-      artStyle,
-      idea,
-      mimeType,
-      imgHash,
-    ].join("|");
+    const cacheKey = ["analyze:v2", mode, target, artStyle, idea, mimeType, imgHash].join("|");
 
     const cached = cacheGet(cacheKey);
-    if (cached) {
-      return NextResponse.json(cached);
-    }
+    if (cached) return NextResponse.json(cached);
 
     const ai = new GoogleGenAI({ apiKey });
 
@@ -397,23 +405,18 @@ User idea (optional):
 ${idea || "(none)"}
 `.trim();
 
-    const schema = zodToJsonSchema(OutputSchema);
-
     async function generateOnce(model: string) {
       return ai.models.generateContent({
         model,
         contents: [
           {
             role: "user",
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType, data: b64 } },
-            ],
+            parts: [{ text: prompt }, { inlineData: { mimeType, data: b64 } }],
           },
         ],
         config: {
           responseMimeType: "application/json",
-          responseJsonSchema: schema,
+          responseJsonSchema: OutputJsonSchema, // ✅ NO zod
         },
       });
     }
@@ -431,22 +434,14 @@ ${idea || "(none)"}
           return await generateOnce(model);
         } catch (e: any) {
           lastErr = e;
-
-          // quota: throw ra ngoài để đổi model
           if (isQuotaExceededError(e)) throw e;
-
-          // overload: retry
           if (!isOverloadedError(e)) throw e;
         }
       }
       throw lastErr;
     }
 
-    const modelFallbacks = [
-      "gemini-2.5-flash-lite",
-      "gemini-2.5-flash",
-      "gemini-2.0-flash",
-    ];
+    const modelFallbacks = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"];
 
     let response: any = null;
     let lastErr: any = null;
@@ -474,9 +469,7 @@ ${idea || "(none)"}
           },
           {
             status: 429,
-            headers: retryAfterSeconds
-              ? { "Retry-After": String(retryAfterSeconds) }
-              : undefined,
+            headers: retryAfterSeconds ? { "Retry-After": String(retryAfterSeconds) } : undefined,
           }
         );
       }
@@ -487,7 +480,7 @@ ${idea || "(none)"}
       );
     }
 
-    const txt = extractResponseText(response);
+    const txt = await getResponseText(response);
     let parsed: any;
     try {
       parsed = JSON.parse(txt || "{}");
@@ -499,12 +492,28 @@ ${idea || "(none)"}
     }
 
     const data = normalizeOutput(parsed, artStyle);
-
-    // cache it
     cacheSet(cacheKey, data);
 
     return NextResponse.json(data);
   } catch (err: any) {
+    if (isQuotaExceededError(err)) {
+      const retryAfterSeconds = extractRetryAfterSeconds(err);
+      return NextResponse.json(
+        { error: "Quota exceeded", detail: String(err?.message ?? err), retryAfterSeconds },
+        {
+          status: 429,
+          headers: retryAfterSeconds ? { "Retry-After": String(retryAfterSeconds) } : undefined,
+        }
+      );
+    }
+
+    if (isOverloadedError(err)) {
+      return NextResponse.json(
+        { error: "Model overloaded", detail: String(err?.message ?? err) },
+        { status: 503 }
+      );
+    }
+
     return NextResponse.json(
       { error: "Analyze failed", detail: String(err?.message ?? err) },
       { status: 500 }
